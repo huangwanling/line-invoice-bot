@@ -19,26 +19,29 @@ line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 
 def get_winning_numbers():
-    """ 穩定版爬蟲：加入錯誤捕捉，避免 NoneType 錯誤 """
+    """ 專業版爬蟲：加入 Headers 模擬瀏覽器，確保不被官網擋下 """
     try:
         url = 'https://invoice.etax.nat.gov.tw/index.html'
-        res = requests.get(url, timeout=10)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        res = requests.get(url, headers=headers, timeout=15)
         res.encoding = 'utf-8'
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 尋找核心容器
-        content = soup.find('div', class_='etw-content-left')
-        if not content: return None, None, None, None
+        # 尋找所有紅色號碼區塊
+        red_spans = soup.find_all('span', class_='etw-color-red')
+        if not red_spans or len(red_spans) < 3:
+            return None, None, None, None
+            
+        period = soup.find('h2', class_='etw-tittle-1').text.strip()
+        special = red_spans[0].text.strip()
+        grand = red_spans[1].text.strip()
+        heads = [s.text.strip() for s in red_spans[2:5]]
         
-        period = content.find('h2').text.strip()
-        # 抓取所有紅色字的號碼
-        numbers = [n.text.strip() for n in content.find_all('span', class_='etw-color-red')]
-        
-        # 確保有足夠的資料，避免 IndexError
-        if len(numbers) < 5: return None, None, None, None
-        
-        return period, numbers[0], numbers[1], numbers[2:5]
-    except:
+        return period, special, grand, heads
+    except Exception as e:
+        print(f"爬蟲發生錯誤: {e}")
         return None, None, None, None
 
 def check_win(number):
@@ -47,12 +50,12 @@ def check_win(number):
         return "系統目前無法讀取官網號碼，請稍後再試。"
     
     if number == special[-3:]:
-        return f"🎉 中獎！【特別獎】\n期別：{period}\n末三碼：{number}"
+        return f"🎉 中獎！【特別獎】(1000萬)\n期別：{period}\n末三碼：{number}"
     if number == grand[-3:]:
-        return f"🎉 中獎！【特獎】\n期別：{period}\n末三碼：{number}"
+        return f"🎉 中獎！【特獎】(200萬)\n期別：{period}\n末三碼：{number}"
     for h in heads:
         if number == h[-3:]:
-            return f"🎉 中獎！【頭獎/增開獎】\n期別：{period}\n末三碼：{number}"
+            return f"🎉 中獎！【頭獎/增開獎】(20萬)\n期別：{period}\n末三碼：{number}"
     return f"發票 {number} 經比對 {period}：未中獎"
 
 @handler.add(MessageEvent, message=TextMessage)
@@ -60,7 +63,7 @@ def handle_message(event):
     msg = event.message.text.strip()
     user_id = event.source.user_id
 
-    # 【重要】這裡的關鍵字必須跟你 LINE 選單按鈕設定的「文字」完全一致
+    # 確保字串與 LINE 後台圖文選單設定的「動作文字」完全一致
     if msg == "查看本期中獎號碼":
         period, special, grand, heads = get_winning_numbers()
         if not period:
@@ -77,12 +80,11 @@ def handle_message(event):
                 data = d.to_dict()
                 reply += f"[{data['time'].strftime('%m/%d %H:%M')}] {data['result']}\n"
         except Exception as e:
-            reply = "歷史紀錄讀取失敗，可能是索引尚未建立完成。"
+            reply = "歷史紀錄讀取失敗，請確認 Firebase 索引設定。"
             
     elif msg.isdigit() and len(msg) == 3:
         result = check_win(msg)
-        # 只有在成功對獎後才寫入 Firebase
-        if "無法讀取" not in result:
+        if "中獎" in result or "未中獎" in result:
             db.collection('invoice_records').add({
                 'user_id': user_id, 
                 'number': msg, 
@@ -91,7 +93,7 @@ def handle_message(event):
             })
         reply = result
     else:
-        reply = "請使用下方選單，或直接輸入發票末三碼對獎。"
+        reply = "歡迎！請直接輸入末三碼對獎，或使用下方選單。"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
