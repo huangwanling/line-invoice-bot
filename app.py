@@ -18,38 +18,32 @@ db = firestore.client()
 line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 
-# --- 核心功能：改良版爬蟲 ---
+# --- 核心功能：爬蟲與對獎 ---
 def get_winning_numbers():
-    try:
-        url = 'https://invoice.etax.nat.gov.tw/index.html'
-        res = requests.get(url)
-        res.encoding = 'utf-8'
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        # 抓取整個內容區塊
-        content = soup.find('div', class_='etw-content-left')
-        period = content.find('h2').text.strip()
-        
-        # 抓取所有紅色字的號碼
-        numbers = [n.text.strip() for n in content.find_all('span', class_='etw-color-red')]
-        
-        # 結構：特別獎(numbers[0])、特獎(numbers[1])、頭獎(numbers[2], [3], [4])
-        return period, numbers[0], numbers[1], numbers[2:5]
-    except Exception as e:
-        return None, None, None, None
+    url = 'https://invoice.etax.nat.gov.tw/index.html'
+    res = requests.get(url)
+    res.encoding = 'utf-8'
+    soup = BeautifulSoup(res.text, 'html.parser')
+    period = soup.find('h2').text.strip()
+    
+    # 這裡抓取官網的對應數字
+    # 特別獎/特獎/頭獎列表
+    prizes = [n.text.strip() for n in soup.find_all('p', class_='etw-tbig')]
+    first_prizes = soup.find('p', class_='etw-tbig-1').text.strip().split('、')
+    
+    return period, prizes[0], prizes[1], first_prizes
 
 def check_win(number):
     period, special, grand, heads = get_winning_numbers()
-    if not period:
-        return "系統目前無法抓取號碼，請稍後再試。"
     
+    # 比對邏輯
     if number == special[-3:]:
-        return f"🎉 中獎！【特別獎】\n期別：{period}\n末三碼：{number}\n獎金：1000萬元"
+        return f"🎉 中獎！【特別獎】\n期別：{period}\n號碼：{number}\n獎金：1000萬元"
     if number == grand[-3:]:
-        return f"🎉 中獎！【特獎】\n期別：{period}\n末三碼：{number}\n獎金：200萬元"
+        return f"🎉 中獎！【特獎】\n期別：{period}\n號碼：{number}\n獎金：200萬元"
     for h in heads:
         if number == h[-3:]:
-            return f"🎉 中獎！【頭獎/增開獎】\n期別：{period}\n末三碼：{number}\n獎金：20萬元"
+            return f"🎉 中獎！【頭獎】\n期別：{period}\n號碼：{number}\n獎金：20萬元"
             
     return f"發票 {number} 經比對 {period}：未中獎"
 
@@ -61,10 +55,7 @@ def handle_message(event):
 
     if msg == "查看中獎號碼":
         period, special, grand, heads = get_winning_numbers()
-        if not period:
-            reply = "暫時無法讀取號碼，請稍後再試。"
-        else:
-            reply = f"【{period} 中獎號碼】\n特別獎：{special}\n特獎：{grand}\n頭獎：{', '.join(heads)}\n\n💡 中獎規則：\n六獎：末3碼與頭獎相同(200元)"
+        reply = f"【{period} 中獎號碼】\n特別獎：{special}\n特獎：{grand}\n頭獎：{', '.join(heads)}"
         
     elif msg == "我的發票紀錄":
         docs = db.collection('invoice_records').where('user_id', '==', user_id)\
@@ -84,7 +75,7 @@ def handle_message(event):
         })
         reply = result
     else:
-        reply = "歡迎！請直接輸入發票末三碼對獎，或使用下方選單。"
+        reply = "歡迎使用！請輸入末三碼對獎，或使用下方選單。"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
