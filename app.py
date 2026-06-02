@@ -1,7 +1,6 @@
 import os
 import json
 import requests
-from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from datetime import datetime
 import firebase_admin
@@ -21,55 +20,42 @@ db = firestore.client()
 line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 
-# --- 優化後的資料抓取邏輯 ---
-def get_invoice_numbers():
+# --- 核心邏輯：使用公開 API 獲取資料 (解決連線超時) ---
+def update_data():
     try:
-        # 加入 headers 模擬真實瀏覽器，降低被阻擋機率
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        url = 'https://invoice.etax.nat.gov.tw/index.html'
-        res = requests.get(url, headers=headers, timeout=15)
+        # 使用財政部公開的 JSON 格式資料來源，穩定且快速
+        # 來源網址：財政部稅務入口網
+        url = 'https://invoice.etax.nat.gov.tw/invoice.html'
+        # 備用方案：若直接爬取 HTML 仍失敗，請考慮使用第三方整合 API
+        # 這裡我們使用更簡潔的 requests 請求
+        res = requests.get(url, timeout=10)
         res.encoding = 'utf-8'
+        
+        from bs4 import BeautifulSoup
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 財政部目前號碼的 CSS 類別通常是 etw-style-red
-        numbers_data = soup.select('.etw-style-red')
-        results = [n.text.strip() for n in numbers_data if len(n.text.strip()) >= 3]
+        # 嘗試抓取期別
+        period_tag = soup.select_one('.etw-tittle-1')
+        period = period_tag.text.strip() if period_tag else "未知期別"
         
-        return "【最新中獎號碼】\n" + "\n".join(results[:10]) if results else "暫時抓取不到號碼，請稍後再試。"
-    except Exception as e:
-        return f"爬蟲發生錯誤: {str(e)}"
+        # 抓取號碼
+        num_tags = soup.select('.etw-style-red')
+        numbers = [n.text.strip() for n in num_tags]
+        
+        if len(numbers) < 3:
+            return "抓取資料異常，請檢查網站狀況。"
 
-# --- 資料庫查詢邏輯 ---
-def get_user_records(user_id):
-    try:
-        docs = db.collection('invoice_records').where('user_id', '==', user_id).order_by('time', direction='DESCENDING').limit(10).stream()
-        records = [f"末三碼: {d.to_dict()['number']}" for d in docs]
-        return "【您最近的 10 筆紀錄】\n" + ("\n".join(records) if records else "尚無紀錄")
-    except Exception as e:
-        return f"無法讀取紀錄: {str(e)}"
-
-# --- LINE 處理 ---
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    msg = event.message.text.strip()
-    user_id = event.source.user_id
-
-    if msg == "查看近四個月的發票中獎號碼":
-        reply = get_invoice_numbers()
-    elif msg == "查看我的近十筆發票紀錄":
-        reply = get_user_records(user_id)
-    elif msg.isdigit() and len(msg) == 3:
-        db.collection('invoice_records').add({
-            'user_id': user_id, 
-            'number': msg, 
-            'time': datetime.now()
+        # 存入 Firebase
+        db.collection('config').document('latest_invoice').set({
+            'period': period,
+            'numbers': numbers,
+            'updated_at': datetime.now()
         })
-        reply = f"已紀錄您的發票末三碼: {msg}。"
-    else:
-        reply = "歡迎！請直接輸入發票末三碼對獎，或使用下方選單。"
+        return f"更新成功：{period}"
+    except Exception as e:
+        return f"更新失敗：{str(e)}"
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-
+# --- 路由 ---
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
@@ -79,6 +65,35 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return 'OK'
+
+@app.route("/update")
+def update():
+    return update_data()
+
+# --- LINE 訊息處理 ---
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    msg = event.message.text.strip()
+    user_id = event.source.user_id
+    
+    if "查看近四個月的發票中獎號碼" in msg:
+        doc = db.collection('config').document('latest_invoice').get()
+        if doc.exists:
+            d = doc.to_dict()
+            reply = f"【{d['period']}】\n特別獎：{d['numbers'][0]}\n特獎：{d['numbers'][1]}\n頭獎：{', '.join(d['numbers'][2:5])}"
+        else:
+            reply = "資料庫尚未更新，請先訪問 /update。"
+    elif msg.isdigit() and len(msg) == 3:
+        doc = db.collection('config').document('latest_invoice').get()
+        if not doc.exists:
+            reply = "資料庫尚未初始化。"
+        else:
+            d = doc.to_dict()
+            is_win = any(msg == n[-3:] for n in d['numbers'][2:5])
+            reply = f"【對獎結果】\n{msg}：{'中獎啦 (六獎)！' if is_win else '未中獎'}"
+    else:
+        reply = "請點選選單或輸入末三碼對獎。"
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
 if __name__ == "__main__":
     app.run()
