@@ -20,29 +20,32 @@ db = firestore.client()
 line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 
-# --- 核心邏輯：更新資料 ---
+# --- 核心邏輯：使用公開 API 獲取資料 (穩定版) ---
 def update_data():
     try:
-        # 使用財政部公開資料網址
-        url = 'https://invoice.etax.nat.gov.tw/invoice.html'
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers, timeout=15)
-        res.encoding = 'utf-8'
-        # 此處保留您原先的 BeautifulSoup 邏輯，但若持續失敗請改用 API
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(res.text, 'html.parser')
+        # 使用第三方維護的穩定 API
+        response = requests.get("https://invoice.run.place/latest", timeout=10)
+        data = response.json()
         
-        period = soup.select_one('.etw-tittle-1').text.strip()
-        numbers = [n.text.strip() for n in soup.select('.etw-style-red')]
+        # 整理資料
+        period = data['period']
+        numbers = [
+            data['super_prize'],  # 特別獎
+            data['spc_prize'],    # 特獎
+            data['first_prize1'], # 頭獎1
+            data['first_prize2'], # 頭獎2
+            data['first_prize3']  # 頭獎3
+        ]
         
+        # 寫入 Firebase
         db.collection('config').document('latest_invoice').set({
             'period': period,
             'numbers': numbers,
             'updated_at': datetime.now()
         })
-        return f"更新成功：{period}"
+        return f"更新成功！最新期別：{period}"
     except Exception as e:
-        return f"更新失敗：{str(e)}"
+        return f"更新失敗，請檢查 API 或網路：{str(e)}"
 
 # --- 路由 ---
 @app.route("/callback", methods=['POST'])
@@ -51,7 +54,7 @@ def callback():
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
-    except Exception:
+    except InvalidSignatureError:
         abort(400)
     return 'OK'
 
@@ -67,11 +70,11 @@ def handle_message(event):
         doc = db.collection('config').document('latest_invoice').get()
         if doc.exists:
             d = doc.to_dict()
-            reply = f"【{d['period']}】\n特別獎：{d['numbers'][0]}\n特獎：{d['numbers'][1]}"
+            reply = f"【{d['period']}】\n特別獎：{d['numbers'][0]}\n特獎：{d['numbers'][1]}\n頭獎：{', '.join(d['numbers'][2:])}"
         else:
             reply = "資料庫尚未初始化，請訪問 /update。"
     else:
-        reply = "請點選下方選單。"
+        reply = "請點選下方選單或輸入末三碼對獎。"
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
 if __name__ == "__main__":
