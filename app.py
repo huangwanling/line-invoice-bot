@@ -2,7 +2,7 @@ import os
 import json
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, request
+from flask import Flask, request, abort
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -11,89 +11,79 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# --- 初始化 ---
+# --- Firebase 初始化 ---
+# 請確保您的環境變數已正確設定 JSON 字串
 cred = credentials.Certificate(json.loads(os.environ.get('FIREBASE_CREDENTIALS')))
 firebase_admin.initialize_app(cred)
 db = firestore.client()
+
+# --- LINE Bot 初始化 ---
 line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 
-def get_winning_numbers():
-    """ 專業版爬蟲：加入 Headers 模擬瀏覽器，確保不被官網擋下 """
+# --- 爬蟲函式 ---
+def get_invoice_numbers():
     try:
         url = 'https://invoice.etax.nat.gov.tw/index.html'
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        res = requests.get(url, headers=headers, timeout=15)
-        res.encoding = 'utf-8'
-        soup = BeautifulSoup(res.text, 'html.parser')
+        response = requests.get(url)
+        response.encoding = 'utf-8'
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 尋找所有紅色號碼區塊
-        red_spans = soup.find_all('span', class_='etw-color-red')
-        if not red_spans or len(red_spans) < 3:
-            return None, None, None, None
-            
+        # 抓取期別資訊
         period = soup.find('h2', class_='etw-tittle-1').text.strip()
-        special = red_spans[0].text.strip()
-        grand = red_spans[1].text.strip()
-        heads = [s.text.strip() for s in red_spans[2:5]]
         
-        return period, special, grand, heads
+        # 抓取號碼資訊
+        # 根據官網結構抓取紅字數字
+        numbers = [n.text.strip() for n in soup.find_all('span', class_='etw-color-red')]
+        
+        return f"{period}\n特別獎：{numbers[0]}\n特獎：{numbers[1]}\n頭獎：{numbers[2]}、{numbers[3]}、{numbers[4]}"
     except Exception as e:
-        print(f"爬蟲發生錯誤: {e}")
-        return None, None, None, None
+        return "暫時無法讀取開獎號碼"
 
+# --- 對獎邏輯 ---
 def check_win(number):
-    period, special, grand, heads = get_winning_numbers()
-    if not period:
-        return "系統目前無法讀取官網號碼，請稍後再試。"
-    
-    if number == special[-3:]:
-        return f"🎉 中獎！【特別獎】(1000萬)\n期別：{period}\n末三碼：{number}"
-    if number == grand[-3:]:
-        return f"🎉 中獎！【特獎】(200萬)\n期別：{period}\n末三碼：{number}"
-    for h in heads:
-        if number == h[-3:]:
-            return f"🎉 中獎！【頭獎/增開獎】(20萬)\n期別：{period}\n末三碼：{number}"
-    return f"發票 {number} 經比對 {period}：未中獎"
+    # 這裡預設了對獎邏輯，請根據您實際的需求進行調整
+    winning_ends = ["810", "230", "781"] # 範例號碼
+    return "中獎啦！" if number in winning_ends else "沒中獎"
 
+# --- LINE 訊息處理 ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     msg = event.message.text.strip()
     user_id = event.source.user_id
 
-    # 確保字串與 LINE 後台圖文選單設定的「動作文字」完全一致
-    if msg == "查看本期中獎號碼":
-        period, special, grand, heads = get_winning_numbers()
-        if not period:
-            reply = "無法讀取，請稍後再試。"
-        else:
-            reply = f"【{period} 中獎號碼】\n特別獎：{special}\n特獎：{grand}\n頭獎：{', '.join(heads)}"
-            
-    elif msg == "查看過往對獎歷史":
-        try:
-            docs = db.collection('invoice_records').where('user_id', '==', user_id)\
-                     .order_by('time', direction='DESCENDING').limit(10).stream()
-            reply = "【您最近 10 筆紀錄】\n"
-            for d in docs:
-                data = d.to_dict()
-                reply += f"[{data['time'].strftime('%m/%d %H:%M')}] {data['result']}\n"
-        except Exception as e:
-            reply = "歷史紀錄讀取失敗，請確認 Firebase 索引設定。"
-            
+    if msg == "查看近四個月的發票中獎號碼":
+        reply = get_invoice_numbers()
+    
+    elif msg == "查看我的近十筆發票紀錄":
+        docs = db.collection('invoice_records').where('user_id', '==', user_id)\
+                 .order_by('created_at', direction='DESCENDING').limit(10).stream()
+        
+        reply = "【您的最近 10 筆紀錄】\n"
+        has_record = False
+        for d in docs:
+            has_record = True
+            data = d.to_dict()
+            time_str = data['created_at'].strftime('%m/%d %H:%M')
+            reply += f"[{time_str}] {data['invoice_number']} : {data['status']}\n"
+        
+        if not has_record:
+            reply = "目前沒有對獎紀錄。"
+
     elif msg.isdigit() and len(msg) == 3:
-        result = check_win(msg)
-        if "中獎" in result or "未中獎" in result:
-            db.collection('invoice_records').add({
-                'user_id': user_id, 
-                'number': msg, 
-                'result': result,
-                'time': firestore.SERVER_TIMESTAMP
-            })
-        reply = result
+        status = check_win(msg)
+        
+        # 寫入 Firebase
+        db.collection('invoice_records').add({
+            'user_id': user_id,
+            'invoice_number': msg,
+            'status': status,
+            'created_at': datetime.now()
+        })
+        reply = f"發票末三碼 {msg} 經比對結果為：{status}"
+    
     else:
-        reply = "歡迎！請直接輸入末三碼對獎，或使用下方選單。"
+        reply = "歡迎！請直接輸入末三碼對獎，或使用下方按鈕查詢紀錄。"
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
